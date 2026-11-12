@@ -1917,6 +1917,7 @@ public final class AzureBlobStore implements BlobStore {
                             reportedSse(copied.isServerEncrypted()))
                     .versionId(writtenVersionId(copied.getVersionId(),
                             pending))
+                    .copySourceVersionId(copiedVersionId(source))
                     .build();
         } catch (BlobStorageException bse) {
             throw translate(bse, fromContainer, fromName,
@@ -2201,6 +2202,25 @@ public final class AzureBlobStore implements BlobStore {
      */
     private record CopySource(BlobClient client,
             @Nullable BlobProperties properties) { }
+
+    /**
+     * The version a copy read, as S3 reports it in
+     * x-amz-copy-source-version-id: the source's own version id, whether or
+     * not the request named it, and none for the null version, as the
+     * transient store reports none.  An unversioned store reads no
+     * properties and reports none.
+     */
+    private static @Nullable String copiedVersionId(CopySource source) {
+        BlobProperties properties = source.properties();
+        return properties == null ? null : copiedVersionId(
+                properties.getVersionId(), properties.getMetadata());
+    }
+
+    static @Nullable String copiedVersionId(@Nullable String versionId,
+            @Nullable Map<String, String> metadata) {
+        String reported = reportedVersionId(versionId, metadata);
+        return reported.equals(NULL_VERSION_ID) ? null : reported;
+    }
 
     /**
      * The metadata a copy on a versioned store lands with: the request's

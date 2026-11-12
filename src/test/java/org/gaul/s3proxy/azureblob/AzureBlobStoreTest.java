@@ -658,6 +658,23 @@ public final class AzureBlobStoreTest {
     }
 
     /**
+     * A copy reports the version it read, named or not, and none for the
+     * null version: a blob without a version id, or one tagged as written
+     * while Suspended.
+     */
+    @Test
+    public void testCopiedVersionId() {
+        String id = "2026-01-01T00:00:01.0000000Z";
+
+        assertThat(AzureBlobStore.copiedVersionId(id, Map.of()))
+                .isEqualTo(id);
+        assertThat(AzureBlobStore.copiedVersionId(id,
+                Map.of("s3proxy_null_version", "true"))).isNull();
+        assertThat(AzureBlobStore.copiedVersionId(/*versionId=*/ null,
+                Map.of())).isNull();
+    }
+
+    /**
      * A multipart stub Azure kept as a non-current version after it was
      * deleted is no object, and is not promoted into view as one; a stub
      * still current, an upload in progress, lists as before.

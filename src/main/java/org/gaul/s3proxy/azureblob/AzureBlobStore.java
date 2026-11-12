@@ -658,7 +658,7 @@ public final class AzureBlobStore implements BlobStore {
             BlobItem first = it.next();
             String name = first.getName();
             boolean prefix = Boolean.TRUE.equals(first.isPrefix());
-            var versions = new ArrayList<BlobItem>();
+            List<BlobItem> versions = new ArrayList<>();
             versions.add(first);
             while (!prefix && it.hasNext() &&
                     !Boolean.TRUE.equals(it.peek().isPrefix()) &&
@@ -667,6 +667,12 @@ public final class AzureBlobStore implements BlobStore {
             }
             if (after != null && name.compareTo(after) <= 0) {
                 continue;
+            }
+            if (!prefix) {
+                versions = withoutDeletedStubVersions(name, versions);
+                if (versions.isEmpty()) {
+                    continue;
+                }
             }
             BlobItem latest = prefix ? first : latestVersion(versions);
             if (!prefix && isDeleteMarker(latest.getMetadata())) {
@@ -1343,13 +1349,17 @@ public final class AzureBlobStore implements BlobStore {
                 lastVersionId = null;
                 continue;
             }
-            var versions = new ArrayList<BlobItem>();
+            List<BlobItem> versions = new ArrayList<>();
             versions.add(first);
             while (it.hasNext() && !Boolean.TRUE.equals(it.peek().isPrefix()) &&
                     it.peek().getName().equals(name)) {
                 versions.add(it.next());
             }
             if (keyMarker != null && name.compareTo(keyMarker) < 0) {
+                continue;
+            }
+            versions = withoutDeletedStubVersions(name, versions);
+            if (versions.isEmpty()) {
                 continue;
             }
             BlobItem latest = latestVersion(versions);
@@ -2935,15 +2945,82 @@ public final class AzureBlobStore implements BlobStore {
         return true;
     }
 
+    /**
+     * Deletes a multipart upload's stub.  On a versioned account Azure keeps
+     * a deleted blob as a non-current version, which a versioned listing
+     * would promote back into view as an object, so every version of the
+     * stub goes too: its name is the upload's own, and nothing else is ever
+     * written there.  A refused version delete is logged rather than failing
+     * an upload that has already completed or been aborted; listings hide
+     * the stub versions it leaves (see {@link #withoutDeletedStubVersions}).
+     */
+    private void deleteStub(BlobClient stub) {
+        stub.delete();
+        if (!versioning) {
+            return;
+        }
+        try {
+            for (BlobItem version : versions(stub)) {
+                if (version.getVersionId() == null) {
+                    continue;
+                }
+                try {
+                    stub.getVersionClient(version.getVersionId()).delete();
+                } catch (BlobStorageException bse) {
+                    if (!isAbsent(bse)) {
+                        throw bse;
+                    }
+                }
+            }
+        } catch (BlobStorageException bse) {
+            String container = stub.getContainerName();
+            if (!isPermissionRefusal(bse)) {
+                logger.warn("could not remove the versions of multipart" +
+                        " stub {} in {}", stub.getBlobName(), container, bse);
+            } else if (reportCleanupRefusal(container, Instant.now())) {
+                logger.error("Azure refused ({}) to remove the versions of" +
+                        " multipart stub {} in container {}, so hidden" +
+                        " versions will accumulate there until it is" +
+                        " granted Microsoft.Storage/storageAccounts/" +
+                        "blobServices/containers/blobs/deleteBlobVersion/" +
+                        "action (Storage Blob Data Owner or a custom role;" +
+                        " SAS permission x).  Logged at most once per {}" +
+                        " minutes per container.", bse.getErrorCode(),
+                        stub.getBlobName(), container,
+                        CLEANUP_REFUSAL_LOG_INTERVAL.toMinutes(), bse);
+            }
+        }
+    }
+
+    /**
+     * The versions of a key a listing shows: all of them, except under the
+     * multipart stub prefix, where only a stub still current is an upload in
+     * progress and anything else is a version Azure kept of a stub {@link
+     * #deleteStub} could not remove.
+     */
+    static List<BlobItem> withoutDeletedStubVersions(String name,
+            List<BlobItem> versions) {
+        if (!name.startsWith(STUB_BLOB_PREFIX)) {
+            return versions;
+        }
+        var current = new ArrayList<BlobItem>();
+        for (BlobItem version : versions) {
+            if (version.getVersionId() == null ||
+                    Boolean.TRUE.equals(version.isCurrentVersion())) {
+                current.add(version);
+            }
+        }
+        return current;
+    }
+
     @Override
     public void abortMultipartUpload(MultipartUpload mpu) {
         // Delete the stub blob to remove the upload from listMultipartUploads
         // Note: Uncommitted blocks are automatically removed by Azure after 7 days
         try {
-            blobServiceClient
+            deleteStub(blobServiceClient
                     .getBlobContainerClient(mpu.containerName())
-                    .getBlobClient(mpu.id())
-                    .delete();
+                    .getBlobClient(mpu.id()));
         } catch (BlobStorageException bse) {
             if (bse.getStatusCode() == 404) {
                 throw S3Exceptions.noSuchKey(mpu.containerName(), mpu.id(),
@@ -3066,7 +3143,7 @@ public final class AzureBlobStore implements BlobStore {
             var response = client.commitBlockListWithResponse(
                     options, /*timeout=*/ null, /*context=*/ null);
 
-            stubBlobClient.delete();
+            deleteStub(stubBlobClient);
 
             var committed = response.getValue();
             if (pending != null) {
